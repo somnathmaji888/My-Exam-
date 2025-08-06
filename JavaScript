@@ -1,0 +1,75 @@
+document.addEventListener('DOMContentLoaded', function() {
+    // Timer functionality
+    const timerElement = document.getElementById('timer');
+    let duration = parseInt(timerElement.textContent.split(':')[0]);
+    let minutes = duration;
+    let seconds = 0;
+    
+    const timer = setInterval(function() {
+        if (seconds === 0) {
+            if (minutes === 0) {
+                clearInterval(timer);
+                alert('Time is up! Your exam will be submitted automatically.');
+                document.getElementById('exam-form').submit();
+                return;
+            }
+            minutes--;
+            seconds = 59;
+        } else {
+            seconds--;
+        }
+        
+        const displaySeconds = seconds < 10 ? `0${seconds}` : seconds;
+        timerElement.textContent = `${minutes}:${displaySeconds}`;
+        
+        // Flash red when 5 minutes or less remain
+        if (minutes < 5) {
+            timerElement.style.color = 'red';
+            if (seconds % 2 === 0) {
+                timerElement.style.animation = 'blink 1s infinite';
+            }
+        }
+    }, 1000);
+    
+    // Fullscreen enforcement
+    function enterFullscreen() {
+        const elem = document.documentElement;
+        if (elem.requestFullscreen) {
+            elem.requestFullscreen();
+        } else if (elem.webkitRequestFullscreen) { /* Safari */
+            elem.webkitRequestFullscreen();
+        } else if (elem.msRequestFullscreen) { /* IE11 */
+            elem.msRequestFullscreen();
+        }
+    }
+    
+    enterFullscreen();
+    
+    // Detect exit from fullscreen
+    document.addEventListener('fullscreenchange', function() {
+        if (!document.fullscreenElement) {
+            alert('You must stay in fullscreen mode during the exam');
+            enterFullscreen();
+        }
+    });
+    
+    document.addEventListener('webkitfullscreenchange', function() {
+        if (!document.webkitFullscreenElement) {
+            alert('You must stay in fullscreen mode during the exam');
+            enterFullscreen();
+        }
+    });
+    
+    document.addEventListener('msfullscreenchange', function() {
+        if (!document.msFullscreenElement) {
+            alert('You must stay in fullscreen mode during the exam');
+            enterFullscreen();
+        }
+    });
+    
+    // Prevent leaving the page
+    window.addEventListener('beforeunload', function(e) {
+        e.preventDefault();
+        e.returnValue = 'Are you sure you want to leave? Your exam may be submitted.';
+    });
+});
