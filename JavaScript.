@@ -1,0 +1,129 @@
+document.addEventListener('DOMContentLoaded', function() {
+    // Timer functionality
+    const timerElement = document.getElementById('timer');
+    let [minutes, seconds] = timerElement.textContent.split(':').map(Number);
+    let totalSeconds = minutes * 60 + seconds;
+    
+    // Create blink animation if not already defined
+    if (!document.getElementById('blink-animation')) {
+        const style = document.createElement('style');
+        style.id = 'blink-animation';
+        style.textContent = `
+            @keyframes blink {
+                0% { opacity: 1; }
+                50% { opacity: 0.3; }
+                100% { opacity: 1; }
+            }
+        `;
+        document.head.appendChild(style);
+    }
+    
+    const timer = setInterval(function() {
+        totalSeconds--;
+        
+        if (totalSeconds <= 0) {
+            clearInterval(timer);
+            alert('Time is up! Your exam will be submitted automatically.');
+            document.getElementById('exam-form').submit();
+            return;
+        }
+        
+        minutes = Math.floor(totalSeconds / 60);
+        seconds = totalSeconds % 60;
+        
+        const displaySeconds = seconds < 10 ? `0${seconds}` : seconds;
+        timerElement.textContent = `${minutes}:${displaySeconds}`;
+        
+        // Flash red when 5 minutes or less remain
+        if (minutes < 5) {
+            timerElement.style.color = '#ff4d4d';
+            timerElement.style.fontWeight = 'bold';
+            timerElement.style.animation = 'blink 1s infinite';
+        }
+    }, 1000);
+    
+    // Fullscreen enforcement
+    function enterFullscreen() {
+        const elem = document.documentElement;
+        
+        if (elem.requestFullscreen) {
+            elem.requestFullscreen().catch(err => {
+                console.error(`Fullscreen error: ${err.message}`);
+            });
+        } else if (elem.webkitRequestFullscreen) { /* Safari */
+            elem.webkitRequestFullscreen();
+        } else if (elem.msRequestFullscreen) { /* IE11 */
+            elem.msRequestFullscreen();
+        }
+    }
+    
+    function exitFullscreen() {
+        if (document.exitFullscreen) {
+            document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) { /* Safari */
+            document.webkitExitFullscreen();
+        } else if (document.msExitFullscreen) { /* IE11 */
+            document.msExitFullscreen();
+        }
+    }
+    
+    function isFullscreen() {
+        return document.fullscreenElement || 
+               document.webkitFullscreenElement || 
+               document.msFullscreenElement;
+    }
+    
+    // Enter fullscreen on start
+    if (!isFullscreen()) {
+        enterFullscreen();
+    }
+    
+    // Detect exit from fullscreen
+    function handleFullscreenChange() {
+        if (!isFullscreen()) {
+            alert('You must stay in fullscreen mode during the exam. Returning to fullscreen.');
+            enterFullscreen();
+        }
+    }
+    
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
+    document.addEventListener('msfullscreenchange', handleFullscreenChange);
+    
+    // Prevent leaving the page
+    window.addEventListener('beforeunload', function(e) {
+        e.preventDefault();
+        e.returnValue = 'Are you sure you want to leave? Your progress will be lost.';
+        return 'Are you sure you want to leave? Your progress will be lost.';
+    });
+    
+    // Prevent context menu (right-click)
+    document.addEventListener('contextmenu', function(e) {
+        e.preventDefault();
+        alert('Right-click is disabled during the exam');
+    });
+    
+    // Prevent keyboard shortcuts
+    document.addEventListener('keydown', function(e) {
+        // Disable developer tools shortcuts
+        if (e.key === 'F12' || 
+           (e.ctrlKey && e.shiftKey && (e.key === 'I' || e.key === 'J' || e.key === 'C')) || 
+           (e.ctrlKey && e.key === 'U')) {
+            e.preventDefault();
+            alert('Developer tools are disabled during the exam');
+        }
+        
+        // Prevent refresh
+        if (e.ctrlKey && e.key === 'r') {
+            e.preventDefault();
+        }
+    });
+    
+    // Periodically check if still in fullscreen
+    setInterval(() => {
+        if (!isFullscreen()) {
+            alert('Fullscreen mode was exited. Returning to fullscreen.');
+            enterFullscreen();
+        }
+    }, 5000);
+});
