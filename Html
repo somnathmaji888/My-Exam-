@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en" class="{% if dark_mode %}dark-mode{% endif %}">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ exam_title }} - Exam Platform</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="exam-container">
+        <header class="exam-header">
+            <h1>{{ exam_title }}</h1>
+            <div class="exam-info">
+                <span id="timer">{{ duration }}:00</span>
+                <span id="warning-count">Warnings: 0/3</span>
+            </div>
+        </header>
+
+        <form id="exam-form" action="{{ url_for('submit_exam') }}" method="POST">
+            {% for question in questions %}
+            <div class="question">
+                <h3>Question {{ loop.index }} of {{ questions|length }}</h3>
+                <p>{{ question[1] }}</p>
+                
+                <div class="options">
+                    {% if question[2] %}
+                    <label>
+                        <input type="radio" name="question_{{ question[0] }}" value="A" required>
+                        {{ question[2] }}
+                    </label>
+                    {% endif %}
+                    
+                    {% if question[3] %}
+                    <label>
+                        <input type="radio" name="question_{{ question[0] }}" value="B" required>
+                        {{ question[3] }}
+                    </label>
+                    {% endif %}
+                    
+                    {% if question[4] %}
+                    <label>
+                        <input type="radio" name="question_{{ question[0] }}" value="C" required>
+                        {{ question[4] }}
+                    </label>
+                    {% endif %}
+                    
+                    {% if question[5] %}
+                    <label>
+                        <input type="radio" name="question_{{ question[0] }}" value="D" required>
+                        {{ question[5] }}
+                    </label>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+            
+            <div class="exam-actions">
+                <button type="submit" class="btn-submit">Submit Exam</button>
+            </div>
+        </form>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/exam.js') }}"></script>
+    <script>
+        // Initialize SocketIO connection
+        const socket = io();
+        
+        // Handle proctoring warnings
+        socket.on('proctoring_warning', function(data) {
+            alert(data.message);
+            document.getElementById('warning-count').textContent = `Warnings: ${data.warnings}/${data.max_warnings}`;
+        });
+        
+        // Handle exam termination
+        socket.on('exam_terminated', function(data) {
+            alert(data.message);
+            document.getElementById('exam-form').submit();
+        });
+        
+        // Prevent right click
+        document.addEventListener('contextmenu', function(e) {
+            e.preventDefault();
+            alert('Right click is disabled during the exam');
+        });
+        
+        // Prevent keyboard shortcuts
+        document.addEventListener('keydown', function(e) {
+            // Disable F12, Ctrl+Shift+I, Ctrl+Shift+J, Ctrl+Shift+C, Ctrl+U
+            if (e.key === 'F12' || 
+                (e.ctrlKey && e.shiftKey && e.key === 'I') || 
+                (e.ctrlKey && e.shiftKey && e.key === 'J') || 
+                (e.ctrlKey && e.shiftKey && e.key === 'C') || 
+                (e.ctrlKey && e.key === 'U')) {
+                e.preventDefault();
+                alert('Developer tools are disabled during the exam');
+            }
+        });
+    </script>
+</body>
+</html>
