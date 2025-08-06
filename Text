@@ -1,0 +1,20 @@
+/exam_platform
+  /static
+    /css
+      styles.css
+    /js
+      exam.js
+    /evidence
+  /templates
+    404.html
+    create_exam.html
+    exam_details.html
+    exam_interface.html
+    exam_result.html
+    exam_rules.html
+    home.html
+    teacher_dashboard.html
+    teacher_login.html
+    teacher_register.html
+  app.py
+  requirements.txt
