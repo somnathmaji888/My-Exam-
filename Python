@@ -1,0 +1,543 @@
+import os
+import cv2
+import time
+import sqlite3
+import hashlib
+import pyautogui
+import numpy as np
+from flask import Flask, render_template, request, redirect, url_for, session, jsonify, send_from_directory
+from flask_socketio import SocketIO, emit
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
+import face_recognition
+import screeninfo
+import threading
+import warnings
+from uuid import uuid4
+
+# Suppress warnings
+warnings.filterwarnings("ignore")
+pyautogui.FAILSAFE = False
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['SESSION_TYPE'] = 'filesystem'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(minutes=30)
+socketio = SocketIO(app)
+
+# Database setup
+def init_db():
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    
+    # Teachers table
+    c.execute('''CREATE TABLE IF NOT EXISTS teachers
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 full_name TEXT NOT NULL,
+                 email TEXT UNIQUE NOT NULL,
+                 phone TEXT,
+                 password TEXT NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Exams table
+    c.execute('''CREATE TABLE IF NOT EXISTS exams
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 teacher_id INTEGER NOT NULL,
+                 title TEXT NOT NULL,
+                 duration INTEGER NOT NULL,
+                 exam_id TEXT UNIQUE NOT NULL,
+                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 FOREIGN KEY(teacher_id) REFERENCES teachers(id))''')
+    
+    # Questions table
+    c.execute('''CREATE TABLE IF NOT EXISTS questions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 exam_id INTEGER NOT NULL,
+                 question_text TEXT NOT NULL,
+                 option_a TEXT,
+                 option_b TEXT,
+                 option_c TEXT,
+                 option_d TEXT,
+                 correct_answer TEXT NOT NULL,
+                 FOREIGN KEY(exam_id) REFERENCES exams(id))''')
+    
+    # Results table
+    c.execute('''CREATE TABLE IF NOT EXISTS results
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 exam_id INTEGER NOT NULL,
+                 student_name TEXT NOT NULL,
+                 score REAL NOT NULL,
+                 start_time TIMESTAMP,
+                 end_time TIMESTAMP,
+                 warnings INTEGER DEFAULT 0,
+                 cheating_attempts INTEGER DEFAULT 0,
+                 FOREIGN KEY(exam_id) REFERENCES exams(id))''')
+    
+    # Cheating attempts log
+    c.execute('''CREATE TABLE IF NOT EXISTS cheating_logs
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 result_id INTEGER NOT NULL,
+                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                 reason TEXT NOT NULL,
+                 screenshot_path TEXT,
+                 FOREIGN KEY(result_id) REFERENCES results(id))''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# AI Proctoring Variables
+known_faces = []
+face_locations = []
+face_encodings = []
+process_this_frame = True
+proctoring_active = False
+warning_count = 0
+max_warnings = 3
+cheating_attempts = 0
+fullscreen = False
+
+# Dark mode preference
+dark_mode = False
+
+# Error handling
+@app.errorhandler(404)
+def page_not_found(e):
+    error_id = f"bom1::{uuid4().hex[:6]}-{int(time.time())}"
+    return render_template('404.html', 
+                         error_code="NOT_FOUND",
+                         error_id=error_id,
+                         dark_mode=dark_mode), 404
+
+# Routes
+@app.route('/')
+def home():
+    return render_template('home.html', dark_mode=dark_mode)
+
+@app.route('/toggle_dark_mode')
+def toggle_dark_mode():
+    global dark_mode
+    dark_mode = not dark_mode
+    return jsonify({'success': True, 'dark_mode': dark_mode})
+
+# Teacher Authentication
+@app.route('/teacher_register', methods=['GET', 'POST'])
+def teacher_register():
+    if request.method == 'POST':
+        full_name = request.form['full_name']
+        email = request.form['email']
+        phone = request.form['phone']
+        password = request.form['password']
+        hashed_password = generate_password_hash(password, method='sha256')
+        
+        try:
+            conn = sqlite3.connect('exam_platform.db')
+            c = conn.cursor()
+            c.execute("INSERT INTO teachers (full_name, email, phone, password) VALUES (?, ?, ?, ?)",
+                      (full_name, email, phone, hashed_password))
+            conn.commit()
+            conn.close()
+            return redirect(url_for('teacher_login'))
+        except sqlite3.IntegrityError:
+            return render_template('teacher_register.html', error="Email already registered", dark_mode=dark_mode)
+    
+    return render_template('teacher_register.html', dark_mode=dark_mode)
+
+@app.route('/teacher_login', methods=['GET', 'POST'])
+def teacher_login():
+    if request.method == 'POST':
+        email = request.form['email']
+        password = request.form['password']
+        
+        conn = sqlite3.connect('exam_platform.db')
+        c = conn.cursor()
+        c.execute("SELECT * FROM teachers WHERE email=?", (email,))
+        teacher = c.fetchone()
+        conn.close()
+        
+        if teacher and check_password_hash(teacher[4], password):
+            session['teacher_id'] = teacher[0]
+            session['teacher_name'] = teacher[1]
+            session['teacher_email'] = teacher[2]
+            return redirect(url_for('teacher_dashboard'))
+        else:
+            return render_template('teacher_login.html', error="Invalid email or password", dark_mode=dark_mode)
+    
+    return render_template('teacher_login.html', dark_mode=dark_mode)
+
+@app.route('/teacher_dashboard')
+def teacher_dashboard():
+    if 'teacher_id' not in session:
+        return redirect(url_for('teacher_login'))
+    
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id, title, exam_id FROM exams WHERE teacher_id=?", (session['teacher_id'],))
+    exams = c.fetchall()
+    
+    exam_data = []
+    for exam in exams:
+        c.execute("SELECT COUNT(*) FROM results WHERE exam_id=?", (exam[0],))
+        submissions = c.fetchone()[0]
+        
+        c.execute("SELECT AVG(score) FROM results WHERE exam_id=?", (exam[0],))
+        avg_score = c.fetchone()[0] or 0
+        
+        exam_data.append({
+            'id': exam[0],
+            'title': exam[1],
+            'exam_id': exam[2],
+            'submissions': submissions,
+            'avg_score': round(avg_score, 2)
+        })
+    
+    conn.close()
+    return render_template('teacher_dashboard.html', exams=exam_data, teacher_name=session['teacher_name'], dark_mode=dark_mode)
+
+@app.route('/create_exam', methods=['GET', 'POST'])
+def create_exam():
+    if 'teacher_id' not in session:
+        return redirect(url_for('teacher_login'))
+    
+    if request.method == 'POST':
+        title = request.form['title']
+        duration = int(request.form['duration'])
+        exam_id = hashlib.sha256(f"{title}{time.time()}".encode()).hexdigest()[:8].upper()
+        
+        conn = sqlite3.connect('exam_platform.db')
+        c = conn.cursor()
+        c.execute("INSERT INTO exams (teacher_id, title, duration, exam_id) VALUES (?, ?, ?, ?)",
+                  (session['teacher_id'], title, duration, exam_id))
+        exam_db_id = c.lastrowid
+        
+        # Process questions
+        question_count = int(request.form['question_count'])
+        for i in range(1, question_count + 1):
+            question_text = request.form[f'question_{i}_text']
+            option_a = request.form.get(f'question_{i}_option_a', '')
+            option_b = request.form.get(f'question_{i}_option_b', '')
+            option_c = request.form.get(f'question_{i}_option_c', '')
+            option_d = request.form.get(f'question_{i}_option_d', '')
+            correct_answer = request.form[f'question_{i}_correct_answer']
+            
+            c.execute('''INSERT INTO questions 
+                         (exam_id, question_text, option_a, option_b, option_c, option_d, correct_answer)
+                         VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                      (exam_db_id, question_text, option_a, option_b, option_c, option_d, correct_answer))
+        
+        conn.commit()
+        conn.close()
+        return redirect(url_for('teacher_dashboard'))
+    
+    return render_template('create_exam.html', dark_mode=dark_mode)
+
+@app.route('/exam_details/<int:exam_id>')
+def exam_details(exam_id):
+    if 'teacher_id' not in session:
+        return redirect(url_for('teacher_login'))
+    
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    
+    # Get exam info
+    c.execute("SELECT id, title, duration, exam_id FROM exams WHERE id=? AND teacher_id=?", 
+              (exam_id, session['teacher_id']))
+    exam = c.fetchone()
+    
+    if not exam:
+        conn.close()
+        return redirect(url_for('teacher_dashboard'))
+    
+    # Get questions
+    c.execute("SELECT id, question_text, option_a, option_b, option_c, option_d, correct_answer FROM questions WHERE exam_id=?", (exam_id,))
+    questions = c.fetchall()
+    
+    # Get results
+    c.execute("SELECT id, student_name, score, start_time, end_time, warnings, cheating_attempts FROM results WHERE exam_id=? ORDER BY score DESC", (exam_id,))
+    results = c.fetchall()
+    
+    conn.close()
+    
+    exam_data = {
+        'id': exam[0],
+        'title': exam[1],
+        'duration': exam[2],
+        'exam_id': exam[3],
+        'questions': questions,
+        'results': results
+    }
+    
+    return render_template('exam_details.html', exam=exam_data, dark_mode=dark_mode)
+
+# Student Routes
+@app.route('/student_login', methods=['GET', 'POST'])
+def student_login():
+    if request.method == 'POST':
+        exam_id = request.form['exam_id'].strip().upper()
+        student_name = request.form['student_name'].strip()
+        
+        conn = sqlite3.connect('exam_platform.db')
+        c = conn.cursor()
+        c.execute("SELECT id, title, duration FROM exams WHERE exam_id=?", (exam_id,))
+        exam = c.fetchone()
+        
+        if exam:
+            session['exam_id'] = exam[0]
+            session['exam_title'] = exam[1]
+            session['exam_duration'] = exam[2]
+            session['student_name'] = student_name
+            session['start_time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            session['warning_count'] = 0
+            session['cheating_attempts'] = 0
+            
+            # Initialize result record
+            c.execute("INSERT INTO results (exam_id, student_name, score, start_time) VALUES (?, ?, ?, ?)",
+                      (exam[0], student_name, 0, session['start_time']))
+            session['result_id'] = c.lastrowid
+            conn.commit()
+            conn.close()
+            
+            return redirect(url_for('exam_rules'))
+        else:
+            conn.close()
+            return render_template('student_login.html', error="Invalid Exam ID", dark_mode=dark_mode)
+    
+    return render_template('student_login.html', dark_mode=dark_mode)
+
+@app.route('/exam_rules')
+def exam_rules():
+    if 'exam_id' not in session:
+        return redirect(url_for('home'))
+    return render_template('exam_rules.html', dark_mode=dark_mode)
+
+@app.route('/start_exam')
+def start_exam():
+    if 'exam_id' not in session:
+        return redirect(url_for('home'))
+    
+    # Start proctoring thread
+    global proctoring_active
+    proctoring_active = True
+    threading.Thread(target=start_proctoring, daemon=True).start()
+    
+    # Get exam questions
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    c.execute("SELECT id, question_text, option_a, option_b, option_c, option_d FROM questions WHERE exam_id=?", (session['exam_id'],))
+    questions = c.fetchall()
+    conn.close()
+    
+    return render_template('exam_interface.html', 
+                         questions=questions,
+                         exam_title=session['exam_title'],
+                         duration=session['exam_duration'],
+                         dark_mode=dark_mode)
+
+@app.route('/submit_exam', methods=['POST'])
+def submit_exam():
+    if 'exam_id' not in session:
+        return redirect(url_for('home'))
+    
+    # Calculate score
+    answers = request.form.to_dict()
+    score = 0
+    total_questions = 0
+    
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    
+    c.execute("SELECT id, correct_answer FROM questions WHERE exam_id=?", (session['exam_id'],))
+    questions = c.fetchall()
+    
+    for q_id, correct_answer in questions:
+        total_questions += 1
+        if answers.get(f'question_{q_id}') == correct_answer:
+            score += 1
+    
+    final_score = (score / total_questions) * 100 if total_questions > 0 else 0
+    
+    # Update result
+    end_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    c.execute('''UPDATE results 
+                 SET score=?, end_time=?, warnings=?, cheating_attempts=?
+                 WHERE id=?''',
+              (final_score, end_time, session['warning_count'], session['cheating_attempts'], session['result_id']))
+    
+    conn.commit()
+    conn.close()
+    
+    # Stop proctoring
+    global proctoring_active
+    proctoring_active = False
+    
+    # Clear session
+    session.pop('exam_id', None)
+    session.pop('student_name', None)
+    session.pop('start_time', None)
+    session.pop('warning_count', None)
+    session.pop('cheating_attempts', None)
+    session.pop('result_id', None)
+    
+    return render_template('exam_result.html', score=final_score, dark_mode=dark_mode)
+
+# Proctoring Functions
+def start_proctoring():
+    global known_faces, proctoring_active, warning_count, cheating_attempts
+    
+    # Initialize camera
+    video_capture = cv2.VideoCapture(0)
+    if not video_capture.isOpened():
+        print("Error: Could not open video capture")
+        return
+    
+    # Capture initial face for recognition
+    ret, frame = video_capture.read()
+    if ret:
+        rgb_frame = frame[:, :, ::-1]
+        face_locations = face_recognition.face_locations(rgb_frame)
+        if face_locations:
+            known_faces = face_recognition.face_encodings(rgb_frame, face_locations)
+    
+    last_face_check = time.time()
+    last_screen_check = time.time()
+    last_activity_check = time.time()
+    
+    while proctoring_active:
+        current_time = time.time()
+        
+        # Check for face every 2 seconds
+        if current_time - last_face_check > 2:
+            ret, frame = video_capture.read()
+            if ret:
+                rgb_frame = frame[:, :, ::-1]
+                face_locations = face_recognition.face_locations(rgb_frame)
+                
+                if not face_locations and len(known_faces) > 0:
+                    handle_cheating_attempt("No face detected")
+                elif len(known_faces) > 0 and face_locations:
+                    current_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+                    matches = face_recognition.compare_faces(known_faces, current_encodings[0])
+                    if not any(matches):
+                        handle_cheating_attempt("Different face detected")
+                
+                last_face_check = current_time
+        
+        # Check screen activity every 5 seconds
+        if current_time - last_screen_check > 5:
+            if not check_fullscreen():
+                handle_cheating_attempt("Left fullscreen mode")
+            
+            if check_multiple_monitors():
+                handle_cheating_attempt("Multiple monitors detected")
+            
+            last_screen_check = current_time
+        
+        # Check for inactivity every 30 seconds
+        if current_time - last_activity_check > 30:
+            if not check_user_activity():
+                handle_cheating_attempt("No user activity detected")
+            last_activity_check = current_time
+        
+        time.sleep(0.1)
+    
+    video_capture.release()
+
+def handle_cheating_attempt(reason):
+    global warning_count, cheating_attempts
+    
+    # Take screenshot as evidence
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    screenshot_path = f"static/evidence/{session['result_id']}_{timestamp}.png"
+    os.makedirs(os.path.dirname(screenshot_path), exist_ok=True)
+    pyautogui.screenshot(screenshot_path)
+    
+    # Log cheating attempt
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    c.execute("INSERT INTO cheating_logs (result_id, reason, screenshot_path) VALUES (?, ?, ?)",
+              (session['result_id'], reason, screenshot_path))
+    conn.commit()
+    conn.close()
+    
+    cheating_attempts += 1
+    session['cheating_attempts'] = cheating_attempts
+    
+    # Send warning to student
+    socketio.emit('proctoring_warning', {
+        'message': f"Warning: {reason}",
+        'warnings': warning_count,
+        'max_warnings': max_warnings
+    })
+    
+    warning_count += 1
+    session['warning_count'] = warning_count
+    
+    if warning_count >= max_warnings:
+        socketio.emit('exam_terminated', {
+            'message': "Exam terminated due to multiple violations"
+        })
+        time.sleep(2)
+        submit_exam_early()
+
+def submit_exam_early():
+    global proctoring_active
+    proctoring_active = False
+    
+    conn = sqlite3.connect('exam_platform.db')
+    c = conn.cursor()
+    
+    # Calculate partial score based on answered questions
+    c.execute("SELECT COUNT(*) FROM questions WHERE exam_id=?", (session['exam_id'],))
+    total_questions = c.fetchone()[0]
+    
+    if total_questions > 0:
+        c.execute('''UPDATE results 
+                     SET score=0, end_time=?, warnings=?, cheating_attempts=?
+                     WHERE id=?''',
+                  (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+                   session['warning_count'], session['cheating_attempts'], session['result_id']))
+        conn.commit()
+    
+    conn.close()
+
+def check_fullscreen():
+    try:
+        # This is a simplified check - actual implementation may vary by OS
+        screen_width, screen_height = pyautogui.size()
+        window = pyautogui.getActiveWindow()
+        
+        if window:
+            window_rect = window.box()
+            return (window_rect.width == screen_width and window_rect.height == screen_height)
+        return False
+    except:
+        return False
+
+def check_multiple_monitors():
+    return len(screeninfo.get_monitors()) > 1
+
+def check_user_activity():
+    # Check mouse movement
+    current_pos = pyautogui.position()
+    time.sleep(1)
+    new_pos = pyautogui.position()
+    return current_pos != new_pos
+
+# SocketIO Events
+@socketio.on('connect')
+def handle_connect():
+    emit('connection_response', {'data': 'Connected'})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+# Static files
+@app.route('/static/<path:filename>')
+def static_files(filename):
+    return send_from_directory('static', filename)
+
+if __name__ == '__main__':
+    os.makedirs('static/evidence', exist_ok=True)
+    socketio.run(app, debug=True, host='0.0.0.0')
